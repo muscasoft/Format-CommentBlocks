@@ -1,6 +1,7 @@
 ﻿function Get-WrappedLines {
-    # Shared helper: greedy word-wrap of a list of words into lines of at most $MaxLength, each line starts with $Prefix
-    # (indent + optional "# ").
+    # Shared helper: greedy word-wrap of a list of words into lines of at most $MaxLength, each line
+    # starts with $Prefix (indent + optional "# ").
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '', Justification = 'Get-WrappedLines returns a collection of lines by design; the plural is accurate, and this is an internal helper with no external callers.')]
     param(
         [string[]]$Words,
         [string]$Prefix,
@@ -14,6 +15,9 @@
             $current += $word
         }
         elseif ($word.EndsWith('-----') -or ($current.Length + 1 + $word.Length) -le $MaxLength) {
+            # "-----" (five dashes) marks a block of code and must stay on the current line even if
+            # that means exceeding $MaxLength. This is unrelated to "---" (three dashes), which is
+            # just the paragraph-end marker used in Format-CommentBlocks.
             $current += " $word"
         }
         else {
@@ -27,62 +31,116 @@
 }
 
 function Get-LineDiff {
-    # Computes a line-by-line diff between $Original and $New using Longest Common Subsequence (LCS) - the same approach
-    # used by classic 'diff' tools.
+    # Computes a line-by-line diff between $Original and $New using Myers' O(ND) diff algorithm -
+    # the same technique classic 'diff' tools use. Cost scales with the number of differences (D)
+    # between the inputs, not with $Original.Count * $New.Count, so it stays fast even on large
+    # files as long as the two inputs are mostly the same - which holds here, since reflowing
+    # comments only changes a handful of lines out of the whole file.
     # Returns an ordered list of Equal/Delete/Insert operations.
     param(
         [string[]]$Original,
         [string[]]$New
     )
 
-    $n = $Original.Count
-    $m = $New.Count
+    $n    = $Original.Count
+    $m    = $New.Count
+    $maxD = $n + $m
 
-    # Build the LCS table (backwards, so we can reconstruct forwards)
-    $lcs = New-Object 'int[,]' ($n + 1), ($m + 1)
-    for ($i = $n - 1; $i -ge 0; $i--) {
-        for ($j = $m - 1; $j -ge 0; $j--) {
-            if ($Original[$i] -eq $New[$j]) {
-                 $lcs[$i, $j] = $lcs[($i + 1), ($j + 1)] + 1
+    # v[offset + k] holds the furthest x reached on diagonal k so far. Diagonals run from -maxD to
+    # +maxD, so every index is shifted by $offset to fit a 0-based array. The +2 (rather than +1)
+    # leaves one extra slot for the d=0 boundary read, notably when both inputs are empty.
+    $offset = $maxD
+    $v = New-Object 'int[]' (2 * $maxD + 2)
+    $v[$offset + 1] = 0
+
+    # One snapshot of $v per value of $d; needed to walk the trace back into an edit script.
+    $trace = [System.Collections.Generic.List[int[]]]::new()
+
+    $foundD = -1
+    for ($d = 0; $d -le $maxD; $d++) {
+        $trace.Add([int[]]$v.Clone())
+
+        for ($k = -$d; $k -le $d; $k += 2) {
+            if ($k -eq -$d) {
+                $x = $v[$offset + $k + 1]
+            }
+            elseif ($k -eq $d) {
+                $x = $v[$offset + $k - 1] + 1
+            }
+            elseif ($v[$offset + $k - 1] -lt $v[$offset + $k + 1]) {
+                $x = $v[$offset + $k + 1]
             }
             else {
-                $lcs[$i, $j] = [Math]::Max(($lcs[($i + 1), $j]), ($lcs[$i, ($j + 1)]))
+                $x = $v[$offset + $k - 1] + 1
+            }
+            $y = $x - $k
+
+            while ($x -lt $n -and $y -lt $m -and $Original[$x] -eq $New[$y]) {
+                $x++
+                $y++
+            }
+
+            $v[$offset + $k] = $x
+
+            if ($x -ge $n -and $y -ge $m) {
+                $foundD = $d
+                break
             }
         }
+        if ($foundD -ge 0) { break }
     }
 
+    # Walk the trace backwards from (n, m) to (0, 0) to recover the actual edit script, then reverse
+    # it into forward order.
     $result = [System.Collections.Generic.List[object]]::new()
-    $i = 0; $j = 0
+    $x = $n; $y = $m
 
-    while ($i -lt $n -and $j -lt $m) {
-        if ($Original[$i] -eq $New[$j]) {
-            $result.Add([pscustomobject]@{ Type = 'Equal'; Line = $Original[$i]; OldIndex = $i; NewIndex = $j })
-            $i++; $j++
+    for ($d = $trace.Count - 1; $d -ge 0; $d--) {
+        $vPrev = $trace[$d]
+        $k = $x - $y
+
+        if ($k -eq -$d) {
+            $prevK = $k + 1
         }
-        elseif ($lcs[($i + 1), $j] -ge $lcs[$i, ($j + 1)]) {
-            $result.Add([pscustomobject]@{ Type = 'Delete'; Line = $Original[$i]; OldIndex = $i; NewIndex = $null })
-            $i++
+        elseif ($k -eq $d) {
+            $prevK = $k - 1
+        }
+        elseif ($vPrev[$offset + $k - 1] -lt $vPrev[$offset + $k + 1]) {
+            $prevK = $k + 1
         }
         else {
-            $result.Add([pscustomobject]@{ Type = 'Insert'; Line = $New[$j]; OldIndex = $null; NewIndex = $j })
-            $j++
+            $prevK = $k - 1
         }
-    }
-    while ($i -lt $n) {
-        $result.Add([pscustomobject]@{ Type = 'Delete'; Line = $Original[$i]; OldIndex = $i; NewIndex = $null })
-        $i++
-    }
-    while ($j -lt $m) {
-        $result.Add([pscustomobject]@{ Type = 'Insert'; Line = $New[$j]; OldIndex = $null; NewIndex = $j })
-        $j++
+
+        $prevX = $vPrev[$offset + $prevK]
+        $prevY = $prevX - $prevK
+
+        # Every step along the diagonal is an Equal line.
+        while ($x -gt $prevX -and $y -gt $prevY) {
+            $x--; $y--
+            $result.Add([pscustomobject]@{ Type = 'Equal'; Line = $Original[$x]; OldIndex = $x; NewIndex = $y })
+        }
+
+        # The single non-diagonal step (if any) is either an Insert or a Delete.
+        if ($d -gt 0) {
+            if ($x -eq $prevX) {
+                $result.Add([pscustomobject]@{ Type = 'Insert'; Line = $New[$prevY]; OldIndex = $null; NewIndex = $prevY })
+            }
+            else {
+                $result.Add([pscustomobject]@{ Type = 'Delete'; Line = $Original[$prevX]; OldIndex = $prevX; NewIndex = $null })
+            }
+        }
+
+        $x = $prevX; $y = $prevY
     }
 
+    $result.Reverse()
     return ,$result
 }
 
 function Show-ReflowDiff {
-    # Groups the diff into "hunks": clusters of consecutive changes, with $Context unchanged lines before and after for
-    # orientation (like git diff).
+    # Groups the diff into "hunks": clusters of consecutive changes, with $Context unchanged lines
+    # before and after for orientation (like git diff).
     param(
         [string]$FileName,
         [string[]]$Original,
@@ -101,11 +159,12 @@ function Show-ReflowDiff {
     Write-Host "`n--- Diff: $FileName ---" -ForegroundColor Cyan
 
     if ($changeIdx.Count -eq 0) {
-        Write-Host "(geen wijzigingen)" -ForegroundColor DarkGray
+        Write-Host "(no changes)" -ForegroundColor DarkGray
         return
     }
 
-    # Form clusters: changes that are less than (2 * Context) lines apart are merged into a single hunk.
+    # Form clusters: changes that are less than (2 * Context) lines apart are merged into a single
+    # hunk.
     $hunks = [System.Collections.Generic.List[object]]::new()
     $hunkStart = $changeIdx[0]
     $hunkEnd   = $changeIdx[0]
@@ -130,7 +189,7 @@ function Show-ReflowDiff {
         $firstOld = ($diff[$rangeStart..$rangeEnd] | Where-Object OldIndex -ne $null | Select-Object -First 1).OldIndex
         $firstNew = ($diff[$rangeStart..$rangeEnd] | Where-Object NewIndex -ne $null | Select-Object -First 1).NewIndex
 
-        Write-Host "`n@@ regel $($firstOld + 1) / $($firstNew + 1) @@" -ForegroundColor DarkCyan
+        Write-Host "`n@@ line $($firstOld + 1) / $($firstNew + 1) @@" -ForegroundColor DarkCyan
 
         foreach ($entry in $diff[$rangeStart..$rangeEnd]) {
             switch ($entry.Type) {
@@ -158,26 +217,57 @@ function Show-ReflowDiff {
     Maximum line length for reflowed comments. Default: 100.
 .PARAMETER ShowDiff
     Prints a grouped, git-style diff of the changes before writing.
+.PARAMETER NoBackup
+    Skips backing up the original file before writing changes. By default,
+    the original is copied to "<file>.bak" (overwriting any existing
+    backup) before every write; pass -NoBackup to skip that. Backups are
+    already skipped under -WhatIf, since nothing is written in that case
+    either.
+.PARAMETER Help
+    Shows this help text and exits without processing any files. Same as
+    running Get-Help Format-CommentBlocks -Full.
 .EXAMPLE
     Format-CommentBlocks -Path .\MyScript.ps1 -MaxLength 100 -ShowDiff -WhatIf
+.EXAMPLE
+    Format-CommentBlocks -Path .\MyScript.ps1 -NoBackup
 #>
 function Format-CommentBlocks {
-    [CmdletBinding(SupportsShouldProcess)]
+    [CmdletBinding(SupportsShouldProcess, DefaultParameterSetName = 'Run')]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '', Justification = 'Format-CommentBlocks is the published, already-released public function name; renaming now would be a breaking change.')]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'Help', Justification = 'Presence of -Help alone selects the Help parameter set; the switch value itself does not need to be read.')]
     param(
-        [Parameter(Mandatory, ValueFromPipeline)]
+        [Parameter(ParameterSetName = 'Run', Mandatory, ValueFromPipeline)]
         [string[]]$Path,
 
+        [Parameter(ParameterSetName = 'Run')]
         [int]$MaxLength = 100,
 
-        [switch]$ShowDiff
+        [Parameter(ParameterSetName = 'Run')]
+        [switch]$ShowDiff,
+
+        [Parameter(ParameterSetName = 'Run')]
+        [switch]$NoBackup,
+
+        [Parameter(ParameterSetName = 'Help', Mandatory)]
+        [switch]$Help
     )
 
     process {
+        if ($PSCmdlet.ParameterSetName -eq 'Help') {
+            Get-Help Format-CommentBlocks -Full
+            return
+        }
+
         foreach ($file in $Path) {
-            $lines  = Get-Content -Path $file
+            $lines  = @(Get-Content -Path $file -Encoding UTF8)
             $output = [System.Collections.Generic.List[string]]::new()
 
             $linePattern = '^(?<indent>\s*)#(?!region\b|endregion\b|requires\b|!)\s?(?<text>.*)$'
+
+            # Matches "- ", "* ", "+ ", "1. " or "1) " at the start of a comment's text. Lines like
+            # this are list items: they are always wrapped on their own, never merged with a
+            # preceding or following line, regardless of trailing punctuation.
+            $listItemPattern = '^(?:[-*+]\s|\d+[.\)]\s)'
 
             $i = 0
             while ($i -lt $lines.Count) {
@@ -205,12 +295,15 @@ function Format-CommentBlocks {
                         $text = $Matches.text
                         $blockTexts.Add($text.Trim())
 
-                        # Paragraph ends on a period OR on three dashes
-                        $endsParagraph = $text.TrimEnd() -match '(\.|---)$'
+                        # Paragraph ends on a period, on three dashes, or when the line itself is a
+                        # list item (list items always stand alone).
+                        $endsParagraph = ($text.Trim() -match $listItemPattern) -or ($text.TrimEnd() -match '(\.|---)$')
 
                         $nextIsPartOfBlock = $false
                         if (($j + 1) -lt $lines.Count -and $lines[$j + 1] -match $linePattern) {
-                            if ($Matches.text.Trim().Length -gt 0) {
+                            $nextText = $Matches.text.Trim()
+                            # A following list item never gets pulled into this paragraph either.
+                            if ($nextText.Length -gt 0 -and $nextText -notmatch $listItemPattern) {
                                 $nextIsPartOfBlock = $true
                             }
                         }
@@ -239,6 +332,9 @@ function Format-CommentBlocks {
             }
 
             if ($PSCmdlet.ShouldProcess($file, "Reflow comment blocks (max $MaxLength chars)")) {
+                if (-not $NoBackup) {
+                    Copy-Item -Path $file -Destination "$file.bak" -Force
+                }
                 $output | Set-Content -Path $file -Encoding UTF8
             }
         }
